@@ -4,6 +4,7 @@ import terser from "@rollup/plugin-terser"
 import pkg from "./package.json" with { type: "json" }
 
 const externalDependencies = [
+	"crypto",
 	...Object.keys(pkg.peerDependencies || {}),
 	...Object.keys(pkg.dependencies || {}),
 ]

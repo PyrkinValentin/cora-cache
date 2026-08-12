@@ -1,4 +1,4 @@
-import Redis from "ioredis"
+import type Redis from "ioredis"
 
 import { createHash, randomUUID } from "crypto"
 import { serializer } from "./serializer"
@@ -9,36 +9,8 @@ declare module "ioredis" {
 	}
 }
 
+type CreateCacheOptions = { redis: Redis }
 type CacheLife = "seconds" | "minutes" | "hours" | "days" | "weeks" | "max"
-
-const globalForRedis = global as unknown as { redis: Redis | undefined }
-
-const redis = globalForRedis.redis ?? new Redis(process.env.REDIS_URL as string, {
-	retryStrategy: (times) => Math.min(times * 50, 2000),
-	maxRetriesPerRequest: null,
-	enableOfflineQueue: true,
-})
-
-const RELEASE_LOCK_LUA = `
-  if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-  else
-    return 0
-  end
-`
-
-redis.defineCommand("releaseLock", {
-	numberOfKeys: 1,
-	lua: RELEASE_LOCK_LUA,
-})
-
-if (process.env.NODE_ENV !== "production") {
-	globalForRedis.redis = redis
-}
-
-const inflightRequests = new Map<string, Promise<unknown>>()
-
-const UNDEFINED_CACHE_MARKER = "__VAL_IS_UNDEFINED__"
 
 const getSecondsFromLife = (life: CacheLife): number => {
 	switch (life) {
@@ -85,235 +57,232 @@ const sleep = (ms: number) => {
 	return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+const INFLIGHT_REQUESTS = new Map<string, Promise<unknown>>()
+const UNDEFINED_CACHE_MARKER = "__VAL_IS_UNDEFINED__"
+const RELEASE_LOCK_LUA = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`
 /**
- * Low-level API to manually retrieve records from the Redis cache.
- * Looks up the compiled SHA-256 hash matching the provided tag combination.
+ * Creates an isolated high-performance Redis caching engine instance.
+ * Distributes decoupled core methods: `cache`, `getCache`, `setCache`, `invalidateCache`.
  *
- * @template T - The expected return type of the deserialized cache payload.
- * @param {...string[]} tags - A flat collection of tags used to locate the cache entry.
- * @returns {Promise<T | undefined>} The deserialized typed data, or `undefined` if a cache miss occurs.
- *
- * @example
- * // Retrieve custom user with strict type boundaries
- * const user = await getCache<User>(`user:${id}`)
+ * @param {CreateCacheOptions} options - Configuration object containing the `ioredis` instance.
+ * @returns An object with high-throughput cache primitives.
  */
-export const getCache = async <T>(...tags: string[]): Promise<T | undefined> => {
-	if (tags.length === 0) return
+export const createCache = (options: CreateCacheOptions) => {
+	const { redis } = options
 
-	try {
-		const dataKey = generateDataKey(tags)
-		const data = await redis.getBuffer(dataKey)
+	if (
+		typeof redis.defineCommand === "function" &&
+		!redis.releaseLock
+	) {
+		redis.defineCommand("releaseLock", {
+			numberOfKeys: 1,
+			lua: RELEASE_LOCK_LUA,
+		})
+	}
 
-		if (data && data.toString() === UNDEFINED_CACHE_MARKER) {
+	/**
+	 * Retrieves data from the cache using the specified tags.
+	 * Returns `undefined` if a cache miss occurs.
+	 */
+	const getCache = async <T>(...tags: string[]): Promise<T | undefined> => {
+		if (tags.length === 0) return
+
+		try {
+			const dataKey = generateDataKey(tags)
+			const data = await redis.getBuffer(dataKey)
+
+			if (data && data.toString() === UNDEFINED_CACHE_MARKER) {
+				return
+			}
+
+			return serializer.deserialize<T>(data)
+		} catch {
 			return
 		}
-
-		return serializer.deserialize<T>(data)
-	} catch {
-		return
 	}
-}
 
-/**
- * Low-level API to manually commit records into the Redis cache.
- * Serializes the payload and registers explicit tag tracking boundaries.
- *
- * @template T - The type of the data payload being serialized and stored.
- * @param {T} value - The fresh database or application payload to cache.
- * @param {CacheLife} life - The expiration tier lifespan (e.g., `"minutes"`, `"hours"`, `"days"`).
- * @param {...string[]} tags - A flat collection of tags associated with this record for cascading invalidations.
- * @returns {Promise<void>} Resolves once the pipeline commit sequence finishes.
- *
- * @example
- * // Manually hydrate a user profile with a 15-minute expiration lifespan
- * await setCache(user, "minutes", "users", `users:${user.id}`);
- */
-export const setCache = async (value: unknown, life: CacheLife, ...tags: string[]): Promise<"OK" | undefined> => {
-	if (tags.length === 0) return
+	/**
+	 * Saves data into the cache with a defined lifespan and associated tags.
+	 */
+	const setCache = async (value: unknown, life: CacheLife, ...tags: string[]): Promise<"OK" | undefined> => {
+		if (tags.length === 0) return
 
-	try {
-		const dataKey = generateDataKey(tags)
-		const baseSeconds = getSecondsFromLife(life)
-		const secondsWithJitter = applyJitter(baseSeconds)
-		const pipeline = redis.pipeline()
+		try {
+			const dataKey = generateDataKey(tags)
+			const baseSeconds = getSecondsFromLife(life)
+			const secondsWithJitter = applyJitter(baseSeconds)
+			const pipeline = redis.pipeline()
 
-		const payload = value === undefined
-			? Buffer.from(UNDEFINED_CACHE_MARKER)
-			: serializer.serialize(value)
+			const payload = value === undefined
+				? Buffer.from(UNDEFINED_CACHE_MARKER)
+				: serializer.serialize(value)
 
-		pipeline.set(dataKey, payload, "EX", secondsWithJitter)
+			pipeline.set(dataKey, payload, "EX", secondsWithJitter)
 
-		tags.forEach((tag) => {
-			const tagKey = `cache:tag:${tag}`
-			const maxTagLife = Math.floor(baseSeconds * 1.1) + 60
+			tags.forEach((tag) => {
+				const tagKey = `cache:tag:${tag}`
+				const maxTagLife = Math.floor(baseSeconds * 1.1) + 60
 
-			pipeline.sadd(tagKey, dataKey)
-			pipeline.expire(tagKey, maxTagLife)
-		})
+				pipeline.sadd(tagKey, dataKey)
+				pipeline.expire(tagKey, maxTagLife)
+			})
 
-		await pipeline.exec()
+			await pipeline.exec()
 
-		return "OK"
-	} catch {
-		return
+			return "OK"
+		} catch {
+			return
+		}
 	}
-}
 
-/**
- * Deterministic Invalidation API.
- * Purges cache spaces and sweeps all associated method tokens or granular variations
- * via optimized Redis batch pipelines under the provided root tag scopes.
- *
- * @param {...string[]} tags - A collection of root tags or specific keys to evict instantly.
- * @returns {Promise<void>} Resolves when the cleanup pipeline completes execution.
- *
- * @example
- * // Global eviction for all queries tied to the "users" collection space
- * await invalidateCache("users");
- */
-export const invalidateCache = async (...tags: string[]): Promise<boolean> => {
-	if (tags.length === 0) return false
+	/**
+	 * Purges all cache entries and data linked to the specified tags.
+	 */
+	const invalidateCache = async (...tags: string[]): Promise<boolean> => {
+		if (tags.length === 0) return false
 
-	try {
-		const TAGS_CONCURRENCY_LIMIT = 10
+		try {
+			const TAGS_CONCURRENCY_LIMIT = 10
 
-		for (let i = 0; i < tags.length; i += TAGS_CONCURRENCY_LIMIT) {
-			const chunkTags = tags.slice(i, i + TAGS_CONCURRENCY_LIMIT)
+			for (let i = 0; i < tags.length; i += TAGS_CONCURRENCY_LIMIT) {
+				const chunkTags = tags.slice(i, i + TAGS_CONCURRENCY_LIMIT)
 
-			await Promise.all(
-				chunkTags.map(async (tag) => {
-					const tagKey = `cache:tag:${tag}`
-					const CHUNK_SIZE = 500
+				await Promise.all(
+					chunkTags.map(async (tag) => {
+						const tagKey = `cache:tag:${tag}`
+						const CHUNK_SIZE = 500
 
-					let cursor = "0"
-					let deletePipeline = redis.pipeline()
+						let cursor = "0"
+						let deletePipeline = redis.pipeline()
 
-					do {
-						const result = await redis.sscan(
-							tagKey,
-							cursor,
-							"COUNT",
-							1000
-						)
+						do {
+							const result = await redis.sscan(
+								tagKey,
+								cursor,
+								"COUNT",
+								1000
+							)
 
-						const [nextCursor, dataKeys] = result as [string, string[]]
+							const [nextCursor, dataKeys] = result as [string, string[]]
 
-						cursor = nextCursor
+							cursor = nextCursor
 
-						if (dataKeys && dataKeys.length > 0) {
-							for (const key of dataKeys) {
-								deletePipeline.del(key)
+							if (dataKeys && dataKeys.length > 0) {
+								for (const key of dataKeys) {
+									deletePipeline.del(key)
 
-								if (deletePipeline.length >= CHUNK_SIZE) {
-									await deletePipeline.exec()
-									deletePipeline = redis.pipeline()
+									if (deletePipeline.length >= CHUNK_SIZE) {
+										await deletePipeline.exec()
+										deletePipeline = redis.pipeline()
+									}
 								}
 							}
-						}
-					} while (cursor !== "0")
+						} while (cursor !== "0")
 
-					deletePipeline.del(tagKey)
-					await deletePipeline.exec()
-				})
-			)
-		}
-		return true
-	} catch {
-		return false
-	}
-}
-
-/**
- * High-performance smart caching wrapper with built-in Cache Stampede mitigation.
- * Automatically resolves a deterministic key hierarchy using the fetcher's native function name
- * combined with flat runtime dependency inputs.
- *
- * @template T - The inferred return data type from the asynchronous fetcher function.
- * @param {() => Promise<T>} fetcher - An explicit function (preferably named via `function` keyword) that queries the database.
- * @param {CacheLife} life - The target caching lifespan tier (`"seconds"`, `"minutes"`, `"hours"`, etc.).
- * @param {string} tags - The overarching structural tag used to group and bind this query for safe invalidations.
- * @returns {Promise<T>} The cached data payload or a freshly hydrated response.
- *
- * @example
- * async function fetcherUser() { return db.select().from(users).where(...); }
- * const user = await cache(fetcherUser, "minutes", "users", [userId]);
- */
-export const cache = async <T>(
-	fetcher: () => Promise<T>,
-	life: CacheLife,
-	...tags: string[]
-): Promise<T> => {
-	if (tags.length === 0) {
-		throw new Error("Caching requires passing at least one tag in options.tags")
-	}
-
-	const dataKey = generateDataKey(tags)
-
-	if (inflightRequests.has(dataKey)) {
-		return inflightRequests.get(dataKey) as Promise<T>
-	}
-
-	const operationPromise = (async () => {
-		let cached = await getCache<T>(...tags)
-
-		if (cached !== undefined) return cached
-
-		const lockKey = `lock:${dataKey}`
-		const lockValue = randomUUID()
-		const lockTimeout = 10000
-		const maxRetries = 10
-		const baseDelay = 40
-
-		let hasLock = false
-		let retries = 0
-
-		while (!hasLock && retries < maxRetries) {
-			const status = await redis.set(
-				lockKey,
-				lockValue,
-				"PX" as const,
-				lockTimeout,
-				"NX" as const
-			)
-
-			if (status === "OK") {
-				hasLock = true
-			} else {
-				retries++
-
-				const backoffDelay = Math.floor(baseDelay * Math.pow(1.5, retries) + Math.random() * 20)
-
-				await sleep(backoffDelay)
-				cached = await getCache<T>(...tags)
-
-				if (cached !== undefined) return cached
+						deletePipeline.del(tagKey)
+						await deletePipeline.exec()
+					})
+				)
 			}
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	/**
+	 * Fetches data from the cache or executes the fallback fetcher (with built-in stampede protection).
+	 */
+	const cache = async <T>(
+		fetcher: () => Promise<T>,
+		life: CacheLife,
+		...tags: string[]
+	): Promise<T> => {
+		if (tags.length === 0) {
+			throw new Error("Caching requires passing at least one tag in options.tags")
 		}
 
-		if (!hasLock) {
-			cached = await getCache<T>(...tags)
+		const dataKey = generateDataKey(tags)
+
+		if (INFLIGHT_REQUESTS.has(dataKey)) {
+			return INFLIGHT_REQUESTS.get(dataKey) as Promise<T>
+		}
+
+		const operationPromise = (async () => {
+			let cached = await getCache<T>(...tags)
 
 			if (cached !== undefined) return cached
 
-			return await fetcher()
-		}
+			const lockKey = `lock:${dataKey}`
+			const lockValue = randomUUID()
+			const lockTimeout = 10000
+			const maxRetries = 10
+			const baseDelay = 40
+
+			let hasLock = false
+			let retries = 0
+
+			while (!hasLock && retries < maxRetries) {
+				const status = await redis.set(
+					lockKey,
+					lockValue,
+					"PX" as const,
+					lockTimeout,
+					"NX" as const
+				)
+
+				if (status === "OK") {
+					hasLock = true
+				} else {
+					retries++
+
+					const backoffDelay = Math.floor(baseDelay * Math.pow(1.5, retries) + Math.random() * 20)
+
+					await sleep(backoffDelay)
+					cached = await getCache<T>(...tags)
+
+					if (cached !== undefined) return cached
+				}
+			}
+
+			if (!hasLock) {
+				cached = await getCache<T>(...tags)
+
+				if (cached !== undefined) return cached
+
+				return await fetcher()
+			}
+
+			try {
+				const freshData = await fetcher()
+
+				await setCache(freshData, life, ...tags)
+
+				return freshData
+			} finally {
+				await redis.releaseLock(lockKey, lockValue)
+			}
+		})()
+
+		INFLIGHT_REQUESTS.set(dataKey, operationPromise)
 
 		try {
-			const freshData = await fetcher()
-
-			await setCache(freshData, life, ...tags)
-
-			return freshData
+			return await operationPromise
 		} finally {
-			await redis.releaseLock(lockKey, lockValue)
+			INFLIGHT_REQUESTS.delete(dataKey)
 		}
-	})()
+	}
 
-	inflightRequests.set(dataKey, operationPromise)
-
-	try {
-		return await operationPromise
-	} finally {
-		inflightRequests.delete(dataKey)
+	return {
+		getCache,
+		setCache,
+		cache,
+		invalidateCache,
 	}
 }

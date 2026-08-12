@@ -1,1 +1,1 @@
-export { cache, getCache, setCache, invalidateCache } from "./cache"
+export { createCache } from "./cache"

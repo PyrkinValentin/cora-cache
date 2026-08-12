@@ -1,6 +1,6 @@
 {
 	"name": "@cora-cache/redis",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Enterprise-grade Redis caching engine featuring cache stampede protection via distributed locking, automatic function-based tag generation, and atomic pipe-lined invalidation.",
 	"author": "Cora",
 	"homepage": "https://github.com/PyrkinValentin/cora-cache.git",
