@@ -1,0 +1,18 @@
+# dependencies
+/node_modules
+packages/*/node_modules/
+
+# misc
+.DS_Store
+.idea/
+
+# Build outputs (generated after code compilation)
+build/
+packages/*/build/
+
+# Logs error npm
+*.log
+npm-debug.log*
+
+# typescript
+*.tsbuildinfo

@@ -1,0 +1,60 @@
+{
+	"name": "@cora-cache/redis",
+	"version": "1.0.0",
+	"description": "Enterprise-grade Redis caching engine featuring cache stampede protection via distributed locking, automatic function-based tag generation, and atomic pipe-lined invalidation.",
+	"author": "Cora",
+	"homepage": "https://github.com/PyrkinValentin/cora-cache.git",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/PyrkinValentin/cora-cache.git"
+	},
+	"bugs": {
+		"url": "https://github.com/PyrkinValentin/cora-cache/issues"
+	},
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"redis",
+		"cache",
+		"ioredis",
+		"cora-cache",
+		"cache-stampede",
+		"distributed-lock",
+		"tag-cache",
+		"invalidation",
+		"high-performance",
+		"backend",
+		"nodejs",
+		"nextjs"
+	],
+	"main": "./build/index.js",
+	"types": "./build/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./build/index.d.ts",
+			"import": "./build/index.js",
+			"default": "./build/index.js"
+		}
+	},
+	"files": [
+		"build"
+	],
+	"scripts": {
+		"dev": "rollup -c -w",
+		"clean": "rimraf build",
+		"build": "npm run clean && rollup -c"
+	},
+	"peerDependencies": {
+		"ioredis": "^6.0.0"
+	},
+	"dependencies": {
+		"msgpackr": "^2.0.5"
+	},
+	"sideEffects": false,
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=22.0.0"
+	}
+}
