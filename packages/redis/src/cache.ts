@@ -10,9 +10,11 @@ declare module "ioredis" {
 }
 
 type CreateCacheOptions = { redis: Redis }
-type CacheLife = "seconds" | "minutes" | "hours" | "days" | "weeks" | "max"
+type CacheLife = "seconds" | "minutes" | "hours" | "days" | "weeks" | "max" | number
 
 const getSecondsFromLife = (life: CacheLife): number => {
+	if (typeof life === "number") return life
+
 	switch (life) {
 		case "seconds":
 			return 1

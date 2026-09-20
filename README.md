@@ -44,10 +44,10 @@ Initialize your cache client inside a single dedicated entry point (e.g., `@/cac
 import Redis from "ioredis"
 import { createCache } from "@cora-cache/redis"
 
-const redisClient = new Redis(process.env.REDIS_URL as string)
+const redis = new Redis(process.env.REDIS_URL as string)
 
 // Initialize once and export your decoupled core functions
-export const { cache, getCache, setCache, invalidateCache } = createCache({ redisClient })
+export const { cache, getCache, setCache, invalidateCache } = createCache({ redis })
 ```
 
 ### 2. Implementation in Services (Zero Hardcoded Keys)
